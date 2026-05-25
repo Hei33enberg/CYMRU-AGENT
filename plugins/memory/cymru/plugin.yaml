@@ -1,0 +1,4 @@
+name: cymru
+description: "CYMRU Standalone Memory Bridge connecting to Supabase shared database."
+author: "Antigravity"
+version: "1.0.0"
