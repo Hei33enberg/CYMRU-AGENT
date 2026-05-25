@@ -6431,6 +6431,35 @@ class GatewayRunner:
         if self.pairing_store.is_approved(platform_name, user_id):
             return True
 
+        # Check Supabase user_connectors table for dynamic authorization (LINEAR-1834)
+        if platform_name and user_id:
+            try:
+                import httpx
+                supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+                supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+                if supabase_url and supabase_key:
+                    provider = platform_name.lower().strip()
+                    url = f"{supabase_url}/rest/v1/user_connectors?provider=eq.{provider}&access_token=eq.{user_id}&select=user_id"
+                    headers = {
+                        "apikey": supabase_key,
+                        "Authorization": f"Bearer {supabase_key}",
+                        "Content-Type": "application/json"
+                    }
+                    resp = httpx.get(url, headers=headers, timeout=5.0)
+                    if resp.status_code == 200 and resp.json():
+                        logger.info(
+                            "User %s authorized dynamically via Supabase user_connectors for platform %s",
+                            user_id,
+                            platform_name,
+                        )
+                        return True
+            except Exception as e:
+                logger.warning(
+                    "Failed to query user_connectors from Supabase for user %s: %s",
+                    user_id,
+                    e,
+                )
+
         # Check platform-specific and global allowlists
         platform_allowlist = os.getenv(platform_env_map.get(source.platform, ""), "").strip()
         group_user_allowlist = ""
