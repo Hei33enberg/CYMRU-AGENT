@@ -64,6 +64,8 @@ dependencies = [
   # (which is a silent killer on Windows — see CONTRIBUTING.md) and
   # `os.killpg` (which doesn't exist on Windows).
   "psutil==7.2.2",
+  # CYMRU: Supabase client for god_skills bridge (LINEAR-1830)
+  "supabase==2.15.2",
 ]
 
 [project.optional-dependencies]
