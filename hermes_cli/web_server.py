@@ -97,21 +97,42 @@ _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
 
-# CORS: restrict to localhost origins only.  The web UI is intended to run
-# locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
-# read/modify config and secrets.
+# CORS: restrict to localhost + configured CYMRU origins. The web UI runs
+# locally by default; binding to 0.0.0.0 with allow_origins=["*"] would let
+# any website read/modify config and secrets (LINEAR-2120).
+#
+# Override with CYMRU_ALLOWED_ORIGINS=https://a.com,https://b.com (comma list)
+# or CYMRU_ALLOWED_ORIGIN_REGEX=^https://.*\.cymru$ for wildcard subdomains.
+_DEFAULT_ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://localhost:8080",
+    "http://localhost:9119",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:9119",
+    "https://get.cymru",
+    "https://cymru.app",
+]
+_env_origins = os.environ.get("CYMRU_ALLOWED_ORIGINS", "").strip()
+_allowed_origins = (
+    [o.strip() for o in _env_origins.split(",") if o.strip()]
+    if _env_origins
+    else _DEFAULT_ALLOWED_ORIGINS
+)
+_allowed_origin_regex = os.environ.get("CYMRU_ALLOWED_ORIGIN_REGEX", "").strip() or None
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_allowed_origins,
+    allow_origin_regex=_allowed_origin_regex,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Hermes-Session-Token", "X-Requested-With"],
+    allow_credentials=True,
 )
 
 # ---------------------------------------------------------------------------
-# Endpoints that do NOT require the session token.  Everything else under
-# /api/ is gated by the auth middleware below.  Keep this list minimal —
-# only truly non-sensitive, read-only endpoints belong here.
+# Endpoints that do NOT require auth.  Truly anonymous, read-only metadata.
+# Everything else under /api/ is gated by the auth middleware below.
 # ---------------------------------------------------------------------------
 _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/status",
@@ -120,10 +141,18 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/model/info",
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
+    "/api/hub/spoke",
+})
+
+# ---------------------------------------------------------------------------
+# Endpoints that accept EITHER the local session token (dashboard) OR a valid
+# Supabase JWT (remote PWA users). LINEAR-2121 hardening — previously these
+# were anonymous, letting anyone burn LLM/TTS credits.
+# ---------------------------------------------------------------------------
+_USER_AUTH_API_PATHS: frozenset = frozenset({
     "/api/stt",
     "/api/chat",
     "/api/tts",
-    "/api/hub/spoke",
 })
 
 
@@ -151,6 +180,72 @@ def _require_token(request: Request) -> None:
     """Validate the ephemeral session token.  Raises 401 on mismatch."""
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ---------------------------------------------------------------------------
+# Supabase JWT verification (LINEAR-2121).
+#
+# Remote PWA users (CYMRU web app) hit /api/stt|/chat|/tts and must present
+# the access_token issued by Supabase Auth. We verify HS256 with the
+# project-specific JWT secret stored in SUPABASE_JWT_SECRET. If the secret
+# is not configured, JWT auth is disabled and only the local session token
+# is accepted (safe default — no anonymous access).
+# ---------------------------------------------------------------------------
+_SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET", "").strip() or None
+_SUPABASE_JWT_AUDIENCE = os.environ.get("SUPABASE_JWT_AUDIENCE", "authenticated").strip() or "authenticated"
+
+
+def _verify_supabase_jwt(token: str) -> Optional[Dict[str, Any]]:
+    """Verify a Supabase access_token; return claims dict or None.
+
+    Uses PyJWT (already a dep — pyproject.toml). HS256 with the project JWT
+    secret. Validates exp + aud="authenticated". Returns None on any failure.
+    """
+    if not token or not _SUPABASE_JWT_SECRET:
+        return None
+    try:
+        import jwt as _pyjwt  # PyJWT
+    except ImportError:
+        _log.warning("[auth] PyJWT not installed — Supabase JWT auth disabled")
+        return None
+    try:
+        claims = _pyjwt.decode(
+            token,
+            _SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            audience=_SUPABASE_JWT_AUDIENCE,
+            options={"require": ["exp", "sub"]},
+        )
+        return claims if isinstance(claims, dict) else None
+    except Exception as exc:
+        _log.debug("[auth] JWT verification failed: %s", exc)
+        return None
+
+
+def _extract_bearer(request: Request) -> Optional[str]:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip() or None
+    return None
+
+
+def _has_valid_user_auth(request: Request) -> bool:
+    """True if request has a valid session token OR a valid Supabase JWT."""
+    if _has_valid_session_token(request):
+        return True
+    token = _extract_bearer(request)
+    if not token:
+        return False
+    claims = _verify_supabase_jwt(token)
+    if claims is None:
+        return False
+    # Stash user_id for downstream handlers
+    try:
+        request.state.cymru_user_id = claims.get("sub")
+        request.state.cymru_user_role = claims.get("role")
+    except Exception:
+        pass
+    return True
 
 
 # Accepted Host header values for loopback binds. DNS rebinding attacks
@@ -240,9 +335,24 @@ async def host_header_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    """Require the session token on all /api/ routes except the public list."""
+    """Auth gate for /api/ routes.
+
+    - Public paths: pass through (status, schema, dashboard metadata).
+    - User-auth paths (/api/stt, /api/chat, /api/tts): session token OR
+      valid Supabase JWT in Authorization: Bearer header (LINEAR-2121).
+    - Everything else: session token only (local dashboard).
+    """
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS:
+    if not path.startswith("/api/") or path in _PUBLIC_API_PATHS:
+        return await call_next(request)
+
+    if path in _USER_AUTH_API_PATHS:
+        if not _has_valid_user_auth(request):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Unauthorized — valid session token or Supabase JWT required"},
+            )
+    else:
         if not _has_valid_session_token(request):
             return JSONResponse(
                 status_code=401,
@@ -4745,19 +4855,58 @@ import base64
 import os
 import traceback
 
-_god_agent = None
+# ---------------------------------------------------------------------------
+# Per-session god agents (LINEAR-2122).
+#
+# Previously a single global `_god_agent` was rebuilt whenever session_id
+# changed — under concurrent requests two sessions would clobber each other's
+# state (conversation history, persona, tool state). Now we keep a per-session
+# cache guarded by an asyncio.Lock and evict idle sessions after a TTL.
+# ---------------------------------------------------------------------------
+_god_agents: Dict[str, Tuple[Any, float]] = {}  # session_id -> (agent, last_used_ts)
+_god_agents_lock = asyncio.Lock()
+_GOD_AGENT_TTL_SECONDS = 60 * 60  # 1 hour idle eviction
+_GOD_AGENT_MAX_SESSIONS = 256  # hard cap to bound memory
 
-def _get_god_agent(session_id: str):
-    global _god_agent
-    if _god_agent is None or _god_agent.session_id != session_id:
+
+def _evict_idle_agents_locked(now: float) -> None:
+    """Drop entries older than TTL and trim to MAX_SESSIONS. Caller holds lock."""
+    expired = [sid for sid, (_a, ts) in _god_agents.items() if now - ts > _GOD_AGENT_TTL_SECONDS]
+    for sid in expired:
+        _god_agents.pop(sid, None)
+    if len(_god_agents) > _GOD_AGENT_MAX_SESSIONS:
+        # Evict oldest first
+        ordered = sorted(_god_agents.items(), key=lambda kv: kv[1][1])
+        overflow = len(_god_agents) - _GOD_AGENT_MAX_SESSIONS
+        for sid, _ in ordered[:overflow]:
+            _god_agents.pop(sid, None)
+
+
+async def _get_god_agent(session_id: str):
+    """Return (and lazily create) the AIAgent for a given session.
+
+    Thread-safe across concurrent requests: each session_id gets its own
+    agent instance; idle sessions are evicted by TTL.
+    """
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    now = time.time()
+    async with _god_agents_lock:
+        _evict_idle_agents_locked(now)
+        cached = _god_agents.get(session_id)
+        if cached is not None:
+            agent, _ = cached
+            _god_agents[session_id] = (agent, now)
+            return agent
         from run_agent import AIAgent
-        _god_agent = AIAgent(
+        agent = AIAgent(
             platform="god_node",
             session_id=session_id,
             quiet_mode=True,
-            api_mode="chat_completions"
+            api_mode="chat_completions",
         )
-    return _god_agent
+        _god_agents[session_id] = (agent, now)
+        return agent
 
 class STTRequest(BaseModel):
     audio: str
@@ -4800,7 +4949,7 @@ class ChatRequest(BaseModel):
 @app.post("/api/chat")
 async def shaman_chat(req: ChatRequest):
     try:
-        agent = _get_god_agent(req.sessionId)
+        agent = await _get_god_agent(req.sessionId)
         
         system_msg = "Jesteś bogiem cyberprzestrzeni. Mów krótko, enigmatycznie."
         if req.sessionMood:
