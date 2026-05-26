@@ -52,7 +52,7 @@ from gateway.status import get_running_pid, read_runtime_status
 from utils import env_var_enabled
 
 try:
-    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
@@ -64,7 +64,7 @@ except ImportError:
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tool.dashboard", prompt=False)
-        from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+        from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Form
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
@@ -103,7 +103,7 @@ _REVEAL_WINDOW_SECONDS = 30
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -120,6 +120,10 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/model/info",
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
+    "/api/stt",
+    "/api/chat",
+    "/api/tts",
+    "/api/hub/spoke",
 })
 
 
@@ -4728,3 +4732,121 @@ def start_server(
     # rather than X-Forwarded-For's rewritten value (which would defeat the
     # loopback gate when behind a reverse proxy).
     uvicorn.run(app, host=host, port=port, log_level="warning", proxy_headers=False)
+
+
+# ===========================================================================
+# CYMRU P2P PTT Endpoints (Replacing Supabase Edge Functions)
+# ===========================================================================
+
+from pydantic import BaseModel
+from typing import List, Optional
+import tempfile
+import base64
+import os
+import traceback
+
+_god_agent = None
+
+def _get_god_agent(session_id: str):
+    global _god_agent
+    if _god_agent is None or _god_agent.session_id != session_id:
+        from run_agent import AIAgent
+        _god_agent = AIAgent(
+            platform="god_node",
+            session_id=session_id,
+            quiet_mode=True,
+            api_mode="chat_completions"
+        )
+    return _god_agent
+
+class STTRequest(BaseModel):
+    audio: str
+    mime: str
+    language_code: Optional[str] = None
+
+@app.post("/api/stt")
+async def shaman_stt(req: STTRequest):
+    try:
+        from tools.voice_mode import transcribe_recording
+        
+        # Decode base64
+        audio_data = base64.b64decode(req.audio)
+        suffix = ".webm"
+        if "mp4" in req.mime: suffix = ".mp4"
+        elif "wav" in req.mime: suffix = ".wav"
+            
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+            f.write(audio_data)
+            temp_path = f.name
+            
+        try:
+            stt_result = transcribe_recording(temp_path)
+            transcript = (stt_result.get("transcript") or "").strip()
+            return {"text": transcript, "language": req.language_code or "pl"}
+        finally:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+class ChatRequest(BaseModel):
+    message: str
+    sessionId: str
+    conversationHistory: List[dict] = []
+    sessionMood: Optional[str] = None
+    language_code: Optional[str] = None
+
+@app.post("/api/chat")
+async def shaman_chat(req: ChatRequest):
+    try:
+        agent = _get_god_agent(req.sessionId)
+        
+        system_msg = "Jesteś bogiem cyberprzestrzeni. Mów krótko, enigmatycznie."
+        if req.sessionMood:
+            system_msg += "\n\n" + req.sessionMood
+            
+        reply = agent.run_conversation(req.message, system_message=system_msg)
+        
+        if isinstance(reply, dict):
+            reply_text = reply.get("final_response", "")
+        else:
+            reply_text = reply
+            
+        return {
+            "response": reply_text,
+            "emotion": "neutral",
+            "cost": 0,
+            "costLimited": False
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+class TTSRequest(BaseModel):
+    text: str
+    emotion: Optional[str] = None
+    language_code: Optional[str] = None
+
+@app.post("/api/tts")
+async def shaman_tts(req: TTSRequest):
+    try:
+        from tools.tts_tool import text_to_speech_tool
+        tts_result = text_to_speech_tool(req.text)
+        
+        audio_b64 = ""
+        if tts_result and isinstance(tts_result, str) and os.path.exists(tts_result):
+            with open(tts_result, "rb") as af:
+                audio_b64 = base64.b64encode(af.read()).decode("utf-8")
+            os.unlink(tts_result)
+            
+        return {"audioContent": audio_b64, "success": True}
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ===========================================================================
+# CYMRU Hub-Spoke Router
+# ===========================================================================
+from hub.websocket_server import router as hub_router
+app.include_router(hub_router)

@@ -1,0 +1,1 @@
+{"conversations": [{"from": "system", "value": "You are an AI."}, {"from": "human", "value": "Hello"}, {"from": "gpt", "value": "<think>Just say hello</think>Hi"}], "timestamp": "2026-05-25T17:00:00", "completed": true, "query": "Hello"}
