@@ -1,10 +1,41 @@
 import logging
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request, HTTPException
+from pydantic import BaseModel
 from hub.orchestrator import orchestrator
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+class PairingTokenResponse(BaseModel):
+    token: str
+
+@router.post("/api/hub/pairing-token", response_model=PairingTokenResponse)
+async def generate_pairing_token(request: Request):
+    user_id = getattr(request.state, "cymru_user_id", None)
+    if not user_id:
+        from hermes_cli.web_server import _has_valid_session_token
+        if _has_valid_session_token(request):
+            user_id = "local-dashboard-user"
+        else:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    token = orchestrator.generate_pairing_token(user_id)
+    return {"token": token}
+
+class HeartbeatRequest(BaseModel):
+    device_id: str
+
+@router.post("/api/heartbeat")
+async def device_heartbeat(req: HeartbeatRequest, request: Request):
+    user_id = getattr(request.state, "cymru_user_id", None)
+    if not user_id:
+        from hermes_cli.web_server import _has_valid_session_token
+        if not _has_valid_session_token(request):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+            
+    await orchestrator.handle_heartbeat(req.device_id)
+    return {"success": True}
 
 @router.websocket("/api/hub/spoke")
 async def hub_spoke_websocket(websocket: WebSocket, device_id: str = None):
@@ -73,3 +104,4 @@ async def hub_spoke_websocket(websocket: WebSocket, device_id: str = None):
         logger.error(f"Unexpected error in websocket loop for {device_id}: {e}")
     finally:
         await orchestrator.deregister_socket(device_id)
+

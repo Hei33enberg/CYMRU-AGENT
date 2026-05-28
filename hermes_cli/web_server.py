@@ -153,6 +153,8 @@ _USER_AUTH_API_PATHS: frozenset = frozenset({
     "/api/stt",
     "/api/chat",
     "/api/tts",
+    "/api/hub/pairing-token",
+    "/api/heartbeat",
 })
 
 
