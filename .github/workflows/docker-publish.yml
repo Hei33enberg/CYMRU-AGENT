@@ -33,7 +33,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  IMAGE_NAME: cymru/cymru-agent
+  IMAGE_NAME: hei33enberg/cymru-agent
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -305,7 +305,7 @@ jobs:
         id: main_check
         run: |
           set -euo pipefail
-          image=cymru/cymru-agent
+          image=hei33enberg/cymru-agent
 
           image_json=$(
             docker buildx imagetools inspect "${image}:main" \
@@ -445,7 +445,7 @@ jobs:
         id: latest_check
         run: |
           set -euo pipefail
-          image=cymru/cymru-agent
+          image=hei33enberg/cymru-agent
 
           image_json=$(
             docker buildx imagetools inspect "${image}:latest" \
@@ -511,7 +511,7 @@ jobs:
           RELEASE_TAG: ${{ needs.merge.outputs.release_tag }}
         run: |
           set -euo pipefail
-          image=cymru/cymru-agent
+          image=hei33enberg/cymru-agent
           docker buildx imagetools create \
             --tag "${image}:latest" \
             "${image}:${RELEASE_TAG}"
