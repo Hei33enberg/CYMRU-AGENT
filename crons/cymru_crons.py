@@ -15,7 +15,7 @@ Cron schedule:
 from __future__ import annotations
 import os
 import logging
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from supabase import create_client, Client
 from dotenv import load_dotenv
 
@@ -27,6 +27,35 @@ _SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 def _sb() -> Client:
     return create_client(_SUPABASE_URL, _SUPABASE_KEY)
+
+
+def _claim_dispatch(sb: Client, cron_name: str) -> bool:
+    """Atomically claim this cron run across all cymru-agent instances (LINEAR-2352).
+
+    Every instance (VPS / local / hardware) runs the same CYMRU_CRON_SCHEDULE, so
+    without this each tick fired N times — memory_decay decayed N×, proactive_triggers
+    double-processed events, god_proactive double-inserted. We bucket run_at to the
+    current UTC minute (croniter fires on minute boundaries, so all instances of a
+    tick map to the same key) and INSERT into dispatch_lock. The primary key on
+    (cron_name, run_at) means the first INSERT wins; everyone else hits a duplicate-key
+    conflict and skips.
+
+    Fail-open by design: only a *duplicate-key* error means "someone else owns this
+    run" → skip. Any other error (missing table, transient network, RLS) returns True
+    so a misconfiguration can never silently disable every cron — worst case we fall
+    back to the pre-fix behaviour, never to "all crons dead".
+    """
+    run_at = datetime.now(timezone.utc).replace(second=0, microsecond=0).isoformat()
+    try:
+        sb.table("dispatch_lock").insert({"cron_name": cron_name, "run_at": run_at}).execute()
+        return True
+    except Exception as e:
+        msg = str(e).lower()
+        if "duplicate key" in msg or "23505" in msg or "already exists" in msg:
+            logger.info("[CRON] %s already claimed for %s — skipping duplicate run", cron_name, run_at)
+            return False
+        logger.warning("[CRON] %s dispatch-lock claim errored (proceeding fail-open): %s", cron_name, e)
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +71,8 @@ def god_proactive_cron() -> None:
     logger.info("[CRON] god_proactive_cron started at %s", datetime.now(timezone.utc))
     try:
         sb = _sb()
+        if not _claim_dispatch(sb, "god_proactive_cron"):
+            return
         # Fetch all users with recent activity
         yesterday = date.today().isoformat()
         users_resp = sb.table("profiles").select("id").execute()
@@ -120,6 +151,8 @@ def god_knowledge_cron() -> None:
     try:
         import httpx
         sb = _sb()
+        if not _claim_dispatch(sb, "god_knowledge_cron"):
+            return
         harvested = 0
 
         for query in SEPTON_QUERIES:
@@ -164,6 +197,8 @@ def proactive_triggers() -> None:
     logger.info("[CRON] proactive_triggers started at %s", datetime.now(timezone.utc))
     try:
         sb = _sb()
+        if not _claim_dispatch(sb, "proactive_triggers"):
+            return
         # Get users with proactive events enabled
         events_resp = (
             sb.table("user_proactive_events")
@@ -221,6 +256,8 @@ def refresh_live_context() -> None:
         zodiac = next((z for m, d, z in zodiac_dates if (month == m and day >= d) or (month == (m % 12) + 1 and day < d)), "Capricorn")
 
         sb = _sb()
+        if not _claim_dispatch(sb, "refresh_live_context"):
+            return
         sb.table("system_truth").upsert({
             "key": "live_context",
             "value": {
@@ -248,9 +285,18 @@ def memory_decay() -> None:
     logger.info("[CRON] memory_decay started at %s", datetime.now(timezone.utc))
     try:
         sb = _sb()
+        if not _claim_dispatch(sb, "memory_decay"):
+            return
         # Apply decay via SQL RPC if available, else batch update
         sb.rpc("decay_user_memory_scores", {"decay_amount": 0.02}).execute()
         logger.info("[CRON] memory_decay: decay applied")
+        # Housekeeping: prune dispatch_lock rows older than 7 days (runs once/day on
+        # whichever instance won the memory_decay claim).
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+            sb.table("dispatch_lock").delete().lt("claimed_at", cutoff).execute()
+        except Exception as prune_err:
+            logger.debug("[CRON] dispatch_lock prune skipped: %s", prune_err)
     except Exception as e:
         logger.warning("[CRON] memory_decay: RPC not available, skipping. Error: %s", e)
 
