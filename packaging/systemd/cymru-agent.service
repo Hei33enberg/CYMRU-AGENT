@@ -1,0 +1,43 @@
+# CYMRU Agent — systemd unit (LINEAR-2354).
+#
+# Long-lived cymru-agent service for self-host / VPS / CYMRU RAYDIO hardware.
+# Stream C (cymru-os) drops this file UNCHANGED into /etc/systemd/system/ and
+# enables it — do not add device-specific config here; use a drop-in
+# (/etc/systemd/system/cymru-agent.service.d/*.conf) for host overrides.
+#
+# Install:
+#   cp packaging/systemd/cymru-agent.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now cymru-agent
+
+[Unit]
+Description=CYMRU Agent — personal God orchestrator (Hermes)
+Documentation=https://github.com/Hei33enberg/CYMRU-AGENT
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# `cymru-oh start` runs the agent loop + dashboard webserver (:9119) in the
+# foreground (asyncio, blocking) — correct for Type=simple. The CYMRU cron
+# schedule runs in-process; dispatch_lock dedups it across instances (LINEAR-2352).
+ExecStart=/usr/bin/env cymru-oh start
+WorkingDirectory=/opt/cymru/cymru-agent
+# Secrets (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, EXA_API_KEY, …).
+# Leading "-" = optional: the unit still starts if the file is absent.
+EnvironmentFile=-/etc/cymru-agent/cymru-agent.env
+# Unprivileged service account. cymru-os provisions this user in its image;
+# override via drop-in if your host uses a different name.
+User=cymru-agent
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+# Conservative hardening only — the agent shells out to git/npm/MCP
+# subprocesses, so aggressive sandboxing (ProtectHome/ProtectSystem) is left
+# off to avoid breaking them. Tighten via a drop-in if your threat model needs it.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
